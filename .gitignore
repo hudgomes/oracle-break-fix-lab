@@ -1,0 +1,5 @@
+lab.secrets
+backups/
+logs/
+.state/
+*.local
