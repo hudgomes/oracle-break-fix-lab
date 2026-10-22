@@ -535,18 +535,29 @@ fisico_18_datafile_sem_backup() {
   GABARITO_CORPO="Tablespace $ts (datafile $f) foi criada DEPOIS do ultimo backup completo e perdida antes de qualquer backup incremental rodar -- por isso 'restore datafile' falha com RMAN-06026 (sem backup). Licao: sempre fazer backup logo apos criar estrutura nova. Como aqui a tablespace esta vazia e sem uso real, a saida pratica e assumir a perda: 'alter database datafile <num> offline drop;' -- em versoes mais antigas (12.1) isso da ORA-01516 se rodado no CDB root (precisa primeiro 'alter session set container=$PDB;', que funciona mesmo com o root so em mount); em versoes mais novas pode resolver direto. Depois, abrir o que estiver fechado (root e/ou PDB) e recriar a tablespace do zero dentro do PDB."
 }
 
+# Arquivo de lixo na pasta da FRA nao serve: o Oracle so conta na FRA os
+# arquivos que ele mesmo criou (v$recovery_file_dest ignora o resto) e o dd
+# podia encher o disco inteiro. Aqui a cota cai ate o uso real ficar em ~97%;
+# a cota original fica em .state/<nome>.fra_cota_original para o restaurar.
 fisico_19_fra_cheia() {
   local dest; dest=$(sql_root "select value from v\$parameter where name='db_recovery_file_dest';" | head -1 | tr -d ' \t')
   exigir "o caminho da FRA (db_recovery_file_dest)" "$dest" arq
-  local quota; quota=$(sql_root "select value from v\$parameter where name='db_recovery_file_dest_size';" | head -1 | tr -d ' \t')
-  exigir "o tamanho da FRA (db_recovery_file_dest_size)" "$quota" num
-  local quota_mb=$(( quota / 1024 / 1024 ))
-  local alvo_mb=$(( quota_mb * 97 / 100 ))
-  mkdir -p "$dest/LAB_ENCHE_FRA"
-  dd if=/dev/zero of="$dest/LAB_ENCHE_FRA/lixo.dat" bs=1M count="$alvo_mb" >>"$LOG" 2>&1
+  local uso; uso=$(sql_root "select space_limit||':'||(space_used-space_reclaimable) from v\$recovery_file_dest;" | head -1 | tr -d ' \t')
+  exigir "a cota e o uso da FRA (v\$recovery_file_dest)" "$uso" par
+  local cota="${uso%%:*}" usado="${uso##*:}"
+  [ "$usado" -gt 0 ] || abortar_cenario "a FRA esta vazia (uso nao recuperavel = 0), nao ha como deixa-la quase cheia"
+  local nova=$(( (usado * 100 + 96) / 97 ))
+  [ "$nova" -lt "$cota" ] || abortar_cenario "a FRA ja esta com mais de 97% de uso (cota $cota, usado $usado)"
+  # nao sobrescreve: se o 19 rodar de novo sem restaurar, a cota guardada continua a original
+  local estado="$LAB_DIR/.state/${NOME}.fra_cota_original"
+  [ -s "$estado" ] || echo "$cota" > "$estado"
+  sql_root "alter system set db_recovery_file_dest_size=$nova scope=both;" >>"$LOG" 2>&1
+  local conf; conf=$(sql_root "select value from v\$parameter where name='db_recovery_file_dest_size';" | head -1 | tr -d ' \t')
+  [ "$conf" = "$nova" ] || die "nao consegui baixar a cota da FRA (valor atual: '$conf'), veja $LOG"
+  local cota_mb=$(( cota / 1048576 )) nova_mb=$(( nova / 1048576 )) usado_mb=$(( usado / 1048576 ))
   CHAMADO_TITULO="Backups e archivelog comecando a falhar por falta de espaco"
   CHAMADO_CORPO="O job de backup do $ORACLE_SID comecou a falhar e os alertas mencionam a FRA quase cheia."
-  GABARITO_CORPO="FRA ($dest) preenchida artificialmente para ~97% da cota configurada ($quota_mb MB) com um arquivo de lixo em $dest/LAB_ENCHE_FRA/lixo.dat. Correcao imediata: apagar esse arquivo de lixo (nao e backup de verdade) para liberar espaco; correcao definitiva: aumentar 'db_recovery_file_dest_size' ou revisar politica de retencao de backups."
+  GABARITO_CORPO="A cota da FRA ($dest) foi reduzida de $cota_mb MB para $nova_mb MB ('alter system set db_recovery_file_dest_size=$nova scope=both;'), deixando o uso real ($usado_mb MB, sem contar o que o Oracle pode reciclar) em ~97%. Diagnostico: 'select space_limit, space_used, space_reclaimable, number_of_files from v\$recovery_file_dest;' e 'select * from v\$recovery_area_usage;' (por tipo de arquivo); no alert.log aparecem ORA-19815 (aviso de uso) e, quando acabar de vez, ORA-19809/ORA-19804 e o archiver para ('archiver error', sessoes travadas em 'log file switch (archiving needed)'). Correcao imediata: devolver a cota, 'alter system set db_recovery_file_dest_size=${cota_mb}M scope=both;'. Alternativa sem mexer na cota: liberar espaco pelo RMAN ('backup archivelog all delete input;' para outro destino, 'delete obsolete;', 'delete archivelog all completed before ...;' quando ja houver backup). Nunca apagar arquivos da FRA com rm: o Oracle continua contando o espaco ate um 'crosscheck' + 'delete expired'."
 }
 
 fisico_20_listener() {
@@ -740,6 +751,13 @@ cmd_restaurar() {
   sql_root "startup nomount;" >>"$LOG" 2>&1
   # checa pelo v$instance, nao pelo texto (o SQL*Plus pode responder em portugues)
   sql_root "select status from v\$instance;" | grep -q "STARTED" || die "startup nomount falhou, veja $LOG"
+  # cota da FRA reduzida pelo cenario 19: volta antes do restore, porque o
+  # RMAN precisa de espaco na FRA para trazer os archivelogs do backup
+  local cota_fra; cota_fra=$(cat "$LAB_DIR/.state/${NOME}.fra_cota_original" 2>/dev/null)
+  if [[ "$cota_fra" =~ ^[0-9]+$ ]]; then
+    sql_root "alter system set db_recovery_file_dest_size=$cota_fra scope=both;" >>"$LOG" 2>&1
+    log "cota da FRA devolvida para $(( cota_fra / 1048576 )) MB"
+  fi
   local saida
 
   # 1) controlfile da pasta do backup
@@ -782,10 +800,12 @@ alter database open resetlogs;
 
   # 4) sobras de cenarios fora do banco
   local fra; fra=$(sql_root "select value from v\$parameter where name='db_recovery_file_dest';" | head -1 | tr -d ' \t')
+  # versao antiga do cenario 19 enchia a FRA com um arquivo de lixo
   [[ "$fra" == /* ]] && [ -d "$fra/LAB_ENCHE_FRA" ] && rm -rf -- "$fra/LAB_ENCHE_FRA" && log "lixo do cenario 19 removido de $fra"
   lsnrctl status >/dev/null 2>&1 9>&- || { lsnrctl start >>"$LOG" 2>&1 9>&-; log "listener iniciado"; }
 
   verificar_db_aberto || die "restauracao terminou mas o banco/PDB nao esta READ WRITE, veja $LOG"
+  rm -f "$LAB_DIR/.state/${NOME}.fra_cota_original"
   echo "restaurado do backup $dir em $(date)" >> "$LAB_DIR/.state/${NOME}.ultimo_cenario"
   log "Restauracao concluida: banco aberto no ponto do backup $dir (nova incarnation, apos RESETLOGS)."
 }

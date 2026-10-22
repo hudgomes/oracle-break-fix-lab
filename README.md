@@ -159,7 +159,7 @@ novo, como confirmação.
   desse backup e abre com `RESETLOGS` (nova incarnation). Tudo o que
   aconteceu no banco depois do backup se perde, não só o dano do
   cenário. Também recoloca spfile e password file se um cenário os
-  tirou do lugar, remove o lixo do cenário de FRA cheia, sobe o
+  tirou do lugar, devolve a cota da FRA reduzida pelo cenário 19, sobe o
   listener e reabre as PDBs que estavam abertas na hora do backup.
 
 ### Saídas
