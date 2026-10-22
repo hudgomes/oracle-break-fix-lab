@@ -239,7 +239,7 @@ fisico_01_redo_current() {
   sql_root "startup;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Banco nao sobe depois de uma queda de energia"
   CHAMADO_CORPO="Faltou luz aqui e desde que a energia voltou o banco $ORACLE_SID nao conseguiu abrir."
-  GABARITO_CORPO="Removidos os dois membros do grupo de redo CURRENT ($pares) com o banco desligado. Startup falha pedindo recuperacao incompleta. Ha perda do redo nao arquivado (transacoes recentes nao propagadas) -- se o objetivo fosse zero perda, so seria possivel com um membro sobrevivente do mesmo grupo. Recuperacao via RMAN (mais previsivel que o 'recover database until cancel;' interativo do SQL*Plus, que exige responder AUTO/CANCEL no momento certo e e facil de interromper cedo demais por engano): 'recover database until sequence <proxima_sequencia_do_thread>;' seguido de 'alter database open resetlogs;' -- RMAN aplica tudo que existe de arquivado e para exatamente no ponto que falta."
+  GABARITO_CORPO="Removidos os dois membros do grupo de redo CURRENT ($pares) com o banco desligado. Startup falha pedindo recuperacao incompleta. Ha perda do redo nao arquivado (transacoes recentes nao propagadas) -- se o objetivo fosse zero perda, so seria possivel com um membro sobrevivente do mesmo grupo. Recuperacao via RMAN (mais previsivel que o 'recover database until cancel;' interativo do SQL*Plus, que exige responder AUTO/CANCEL no momento certo e e facil de interromper cedo demais por engano): primeiro achar a sequencia certa com 'select max(sequence#)+1 from v\$archived_log where resetlogs_change#=(select resetlogs_change# from v\$database) and deleted=''NO'';' (nao usar max(sequence#) de v\$log direto, inclui a sequencia perdida); depois, tudo numa unica execucao do RMAN -- 'run { set until sequence <essa_sequencia> thread 1; restore database; recover database; }' (restore e recover juntos; so 'recover' sem 'restore' antes pode avancar demais e travar com RMAN-06556) -- por fim 'alter database open resetlogs;'. Um 'recover database;' simples (sem UNTIL) pode parar exatamente no ponto certo mas NAO habilita o RESETLOGS depois (ORA-01139) -- por isso o UNTIL SEQUENCE explicito e necessario."
 }
 
 fisico_02_redo_active() {
@@ -254,7 +254,7 @@ fisico_02_redo_active() {
   sql_root "startup;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Banco caiu e nao volta, fala em redo log"
   CHAMADO_CORPO="O servidor reiniciou sozinho e agora o banco $ORACLE_SID nao abre, aparece erro de redo log no alert."
-  GABARITO_CORPO="Grupo de redo $alvo ainda nao arquivado (ACTIVE) foi destruido com o banco desligado (arquivamento adiado de proposito antes de remover os arquivos). Mesma familia do cenario 1, recuperacao incompleta: via RMAN, 'recover database until sequence <proxima_sequencia_do_thread>;' + 'alter database open resetlogs;' (mais previsivel que o 'recover database until cancel;' interativo do SQL*Plus), com possivel perda de dados nao arquivados."
+  GABARITO_CORPO="Grupo de redo $alvo ainda nao arquivado (ACTIVE) foi destruido com o banco desligado (arquivamento adiado de proposito antes de remover os arquivos). Mesma familia do cenario 1, mesma receita de recuperacao incompleta: achar a sequencia certa ('select max(sequence#)+1 from v\$archived_log where resetlogs_change#=(select resetlogs_change# from v\$database) and deleted=''NO'';'), depois RMAN 'run { set until sequence <essa_sequencia> thread 1; restore database; recover database; }' e 'alter database open resetlogs;' -- com possivel perda de dados nao arquivados."
 }
 
 fisico_03_redo_inactive() {
@@ -333,7 +333,7 @@ fisico_09_datafile_usuario() {
   sql_root "startup;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Erro de arquivo faltando, aplicacao nao grava mais pedidos"
   CHAMADO_CORPO="A aplicacao que usa a tablespace TREINO_DATA do $PDB parou de funcionar, acho que falta um arquivo."
-  GABARITO_CORPO="Datafile da tablespace TREINO_DATA do PDB $PDB removido ($f). Nesta versao (12.1 multitenant) o CDB ROOT nem abre com esse arquivo faltando ('alter database open;' da ORA-01157/ORA-01110) -- e 'alter database datafile offline' direto do root da ORA-01516 (o arquivo e de um PDB, numeracao nao resolve igual fora do container, e nao dá pra trocar de container com o banco so em mount). A saida que funciona: com a instancia em MOUNT, usar RMAN direto (nao precisa estar no container do PDB): 'restore datafile <num>; recover datafile <num>;' e so depois 'alter database open;' -- o restore recria o arquivo (RMAN pode escolher outro nome/pasta OMF, sem problema) e o open segue normal, com o PDB abrindo sozinho via trigger."
+  GABARITO_CORPO="Datafile da tablespace TREINO_DATA do PDB $PDB removido ($f). O efeito no CDB ROOT varia por versao: em 12.1 multitenant o root nem abre com esse arquivo faltando (ORA-01157/ORA-01110 no 'alter database open;'); em versoes mais novas (23ai/26ai) o isolamento e melhor -- o root abre normal e so o PDB $PDB fica MOUNTED. Nos dois casos a saida e a mesma, com a instancia pelo menos em MOUNT: RMAN direto, sem precisar trocar de container (resolve pelo numero absoluto do arquivo): 'restore datafile <num>; recover datafile <num>;' e so depois abrir -- 'alter database open;' se o root tambem estava fechado, ou so 'alter pluggable database $PDB open;' se so o PDB estava preso."
 }
 
 achar_bloco() {
@@ -342,7 +342,10 @@ achar_bloco() {
 }
 
 fisico_10_bloco_tabela() {
-  local fb; fb=$(achar_bloco "select dbms_rowid.rowid_relative_fno(rowid)||':'||dbms_rowid.rowid_block_number(rowid) from treino.pedidos where rownum=1;")
+  # rowid_relative_fno da 0 em tablespace BIGFILE (sem numero relativo no
+  # rowid) -- rowid_to_absolute_fno funciona nos dois casos (smallfile e
+  # bigfile) e sempre bate com file_id de cdb_data_files.
+  local fb; fb=$(achar_bloco "select dbms_rowid.rowid_to_absolute_fno(rowid,'TREINO','PEDIDOS')||':'||dbms_rowid.rowid_block_number(rowid) from treino.pedidos where rownum=1;")
   local fn="${fb%%:*}" bl="${fb##*:}"
   local path; path=$(sql_pdb "select file_name from cdb_data_files where file_id=$fn;" | head -1 | tr -d ' \t')
   sql_root "shutdown immediate;" >>"$LOG" 2>&1
@@ -393,14 +396,14 @@ fisico_14_spfile() {
   sql_root "startup;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Banco nao inicia, nao acha arquivo de parametros"
   CHAMADO_CORPO="Tentei subir o $ORACLE_SID e da erro dizendo que nao encontra o spfile."
-  GABARITO_CORPO="spfile${ORACLE_SID}.ora movido de $spdir. Duas saidas validas: (1) mais simples -- usar a copia de pfile feita no backup ('startup pfile=<copia_do_backup>/init${ORACLE_SID}.ora.bkp;' e depois recriar o spfile com 'create spfile from pfile;'); (2) RMAN 'startup nomount; restore spfile from autobackup;' -- SEM spfile/controlfile valido no dbs, o RMAN pede 'set dbid=<numero>' antes (o dbid esta salvo em dbid.txt no backup) e o 'from autobackup' generico pode nao achar a peca pelo dia/formato default -- se nao achar, apontar a peca exata ('restore spfile from '"'"'<caminho_do_autobackup.bkp>'"'"';'). Depois de restaurar o spfile, 'shutdown abort; startup;' para reiniciar limpo."
+  GABARITO_CORPO="spfile${ORACLE_SID}.ora movido de $spdir. Duas saidas validas: (1) mais simples -- usar a copia de pfile feita no backup ('startup pfile=<copia_do_backup>/init${ORACLE_SID}.ora.bkp;' e depois recriar o spfile com 'create spfile from pfile;'); (2) RMAN 'startup nomount; restore spfile from autobackup;' -- SEM spfile/controlfile valido no dbs, o RMAN pede 'set dbid=<numero>' antes (o dbid esta salvo em dbid.txt no backup) e o 'from autobackup' generico pode nao achar a peca pelo dia/formato default -- se nao achar, apontar a peca exata ('restore spfile from <caminho_do_autobackup.bkp>;'). Depois de restaurar o spfile, 'shutdown abort; startup;' para reiniciar limpo."
 }
 
 fisico_15_orapw() {
   mv "$ORACLE_HOME/dbs/orapw${ORACLE_SID}" "$ORACLE_HOME/dbs/orapw${ORACLE_SID}.escondido" 2>/dev/null
   CHAMADO_TITULO="Ferramenta de monitoramento nao conecta mais via SYSDBA"
   CHAMADO_CORPO="Uma ferramenta que conecta remoto como sysdba (usuario/senha) no $ORACLE_SID comecou a dar ORA-01031."
-  GABARITO_CORPO="Password file orapw${ORACLE_SID} removido de $ORACLE_HOME/dbs. Conexao local '/ as sysdba' continua funcionando (autenticacao por grupo do SO), so quebra autenticacao remota por senha. Correcao: 'orapwd file=$ORACLE_HOME/dbs/orapw${ORACLE_SID} password=<senha> force=y' (ou copiar o orapw salvo no backup)."
+  GABARITO_CORPO="Password file orapw${ORACLE_SID} removido de $ORACLE_HOME/dbs. Conexao local '/ as sysdba' continua funcionando (autenticacao por grupo do SO), so quebra autenticacao remota por senha. Correcao: 'orapwd file=$ORACLE_HOME/dbs/orapw${ORACLE_SID} password=<senha> force=y' (ou copiar o orapw salvo no backup). Em versoes mais novas (23ai/26ai) o orapwd valida complexidade de senha (OPW-00029) -- a senha precisa ter numero, letra e caractere especial, ex.: 'Senha#123456'."
 }
 
 fisico_16_archive_faltando() {
@@ -422,14 +425,14 @@ fisico_17_archive_corrompido() {
 
 fisico_18_datafile_sem_backup() {
   local ts="LAB_SEM_BKP_$(date +%s)"
-  sql_pdb "create tablespace $ts datafile size 5M;" >>"$LOG" 2>&1
+  sql_pdb "create tablespace $ts datafile size 50M;" >>"$LOG" 2>&1
   local f; f=$(sql_pdb "select file_name from cdb_data_files where tablespace_name='$ts' and con_id=(select con_id from v\$pdbs where name='$PDB');" | head -1 | tr -d ' \t')
   sql_root "shutdown abort;" >>"$LOG" 2>&1
   rm -f "$f"
   sql_root "startup;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Tablespace nova nao abre, RMAN nao acha backup dela"
   CHAMADO_CORPO="Criamos uma tablespace nova ontem e hoje o arquivo dela desapareceu; o RMAN diz que nao tem backup."
-  GABARITO_CORPO="Tablespace $ts (datafile $f) foi criada DEPOIS do ultimo backup completo e perdida antes de qualquer backup incremental rodar -- por isso 'restore datafile' falha com RMAN-06026 (sem backup). Licao: sempre fazer backup logo apos criar estrutura nova. Como aqui a tablespace esta vazia e sem uso real, a saida pratica e assumir a perda: com a instancia em MOUNT, 'alter database datafile <num> offline drop;' da ORA-01516 se rodado no CDB root -- e um datafile do PDB, precisa primeiro 'alter session set container=$PDB;' (funciona mesmo com o root so em mount) e SO DEPOIS o offline drop. Daí 'alter database open;' (no root) e recriar a tablespace do zero dentro do PDB."
+  GABARITO_CORPO="Tablespace $ts (datafile $f) foi criada DEPOIS do ultimo backup completo e perdida antes de qualquer backup incremental rodar -- por isso 'restore datafile' falha com RMAN-06026 (sem backup). Licao: sempre fazer backup logo apos criar estrutura nova. Como aqui a tablespace esta vazia e sem uso real, a saida pratica e assumir a perda: 'alter database datafile <num> offline drop;' -- em versoes mais antigas (12.1) isso da ORA-01516 se rodado no CDB root (precisa primeiro 'alter session set container=$PDB;', que funciona mesmo com o root so em mount); em versoes mais novas pode resolver direto. Depois, abrir o que estiver fechado (root e/ou PDB) e recriar a tablespace do zero dentro do PDB."
 }
 
 fisico_19_fra_cheia() {
@@ -457,7 +460,7 @@ fisico_21_controlfile_todos() {
   sql_root "startup nomount;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Banco nao monta, nenhum controlfile encontrado"
   CHAMADO_CORPO="Perdemos TODOS os controlfiles do $ORACLE_SID num problema de disco. O banco nem monta."
-  GABARITO_CORPO="Os controlfiles ($cfs) foram todos removidos. Sem nenhuma copia local, a saida e RMAN: 'startup nomount;' (sem spfile/controlfile valido, pode pedir 'set dbid=<numero>', salvo em dbid.txt no backup); 'restore controlfile from autobackup;' (se o 'from autobackup' generico nao achar pelo dia/formato, apontar a peca exata: 'restore controlfile from '"'"'<caminho_do_autobackup.bkp>'"'"';'); 'alter database mount; restore database; recover database;' (RMAN detecta sozinho que o controlfile e restaurado, nao precisa da clausula 'using backup controlfile'); por fim 'alter database open resetlogs;' -- o cenario mais severo do laboratorio fisico, mas sem perda de dados se o backup+archivelog estiverem em dia."
+  GABARITO_CORPO="Os controlfiles ($cfs) foram todos removidos. Sem nenhuma copia local, a saida e RMAN: 'startup nomount;' (sem spfile/controlfile valido, pode pedir 'set dbid=<numero>', salvo em dbid.txt no backup); 'restore controlfile from autobackup;' (se o 'from autobackup' generico nao achar pelo dia/formato, apontar a peca exata: 'restore controlfile from <caminho_do_autobackup.bkp>;'); 'alter database mount; restore database; recover database;' (RMAN detecta sozinho que o controlfile e restaurado, nao precisa da clausula 'using backup controlfile'); por fim 'alter database open resetlogs;' -- o cenario mais severo do laboratorio fisico, mas sem perda de dados se o backup+archivelog estiverem em dia."
 }
 
 # -------------------------------------------------------- cenarios logicos --
@@ -472,7 +475,7 @@ logico_02_truncate() {
   sql_pdb "truncate table treino.pedidos;" >>"$LOG" 2>&1
   CHAMADO_TITULO="Tabela de pedidos ficou vazia"
   CHAMADO_CORPO="A tabela TREINO.PEDIDOS esta vazia, ninguem assume ter rodado delete."
-  GABARITO_CORPO="TRUNCATE e DDL -- diferente de DELETE, nao da so para ler dados antigos: Flashback Query pedindo um AS OF anterior ao truncate da ORA-01466 (definicao da tabela mudou), porque o truncate conta como um evento de DDL que fecha a janela de flashback ali (essa e a licao central do cenario). Recuperacao exige RMAN Tablespace Point-in-Time Recovery (ou RECOVER TABLE em versoes que suportam) para uma instancia auxiliar, restaurando a um ponto antes do truncate -- ou, se houver um export Data Pump recente da tabela, restaurar por ele e aceitar que os dados ficam no ponto do export (nao no exato instante antes do truncate), o que costuma ser aceitavel quando a tabela e pequena e isolada (poucas FKs/dependencias de outras tabelas que mudaram desde o export)."
+  GABARITO_CORPO="TRUNCATE e DDL -- diferente de DELETE, Flashback Query NAO traz os dados de volta aqui (essa e a licao central do cenario): pedir um AS OF anterior ao truncate pode dar ORA-01466 (definicao da tabela mudou, em versoes mais antigas) ou simplesmente devolver 0 linhas sem erro (em versoes mais novas) -- o comportamento exato varia por versao, mas o resultado pratico e o mesmo: sem dados. Recuperacao exige RMAN Tablespace Point-in-Time Recovery (ou RECOVER TABLE em versoes que suportam) para uma instancia auxiliar, restaurando a um ponto antes do truncate -- ou, se houver um export Data Pump recente da tabela, restaurar por ele e aceitar que os dados ficam no ponto do export (nao no exato instante antes do truncate), o que costuma ser aceitavel quando a tabela e pequena e isolada (poucas FKs/dependencias de outras tabelas que mudaram desde o export)."
 }
 
 logico_03_delete() {
