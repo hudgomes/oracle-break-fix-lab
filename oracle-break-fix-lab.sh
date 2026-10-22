@@ -201,7 +201,7 @@ backup current controlfile format '$dir/ctl_%U';
   fi
   ls "$dir"/ctl_* >/dev/null 2>&1 || { log "ERRO: peca de controlfile (ctl_*) nao foi gerada em $dir"; return 1; }
 
-  local minseq; minseq=$(sql_root "select min(sequence#) from v\$archived_log where deleted='NO';" | tr -d ' \t')
+  local minseq; minseq=$(sql_root "select min(sequence#) from v\$archived_log where deleted='NO' and resetlogs_change#=(select resetlogs_change# from v\$database);" | tr -d ' \t')
   [ -n "$minseq" ] || minseq=1
   rman_run "
 crosscheck archivelog all;
@@ -488,15 +488,22 @@ fisico_14_spfile() {
 
 fisico_15_orapw() {
   [ -f "$ORACLE_HOME/dbs/orapw${ORACLE_SID}" ] || abortar_cenario "nao achei $ORACLE_HOME/dbs/orapw${ORACLE_SID}"
-  mv"$ORACLE_HOME/dbs/orapw${ORACLE_SID}" "$ORACLE_HOME/dbs/orapw${ORACLE_SID}.escondido" 2>/dev/null
+  mv "$ORACLE_HOME/dbs/orapw${ORACLE_SID}" "$ORACLE_HOME/dbs/orapw${ORACLE_SID}.escondido" 2>/dev/null
   CHAMADO_TITULO="Ferramenta de monitoramento nao conecta mais via SYSDBA"
   CHAMADO_CORPO="Uma ferramenta que conecta remoto como sysdba (usuario/senha) no $ORACLE_SID comecou a dar ORA-01031."
   GABARITO_CORPO="Password file orapw${ORACLE_SID} removido de $ORACLE_HOME/dbs. Conexao local '/ as sysdba' continua funcionando (autenticacao por grupo do SO), so quebra autenticacao remota por senha. Correcao: 'orapwd file=$ORACLE_HOME/dbs/orapw${ORACLE_SID} password=<senha> force=y' (ou copiar o orapw salvo no backup). Em versoes mais novas (23ai/26ai) o orapwd valida complexidade de senha (OPW-00029) -- a senha precisa ter numero, letra e caractere especial, ex.: 'Senha#123456'."
 }
 
+# Archivelog mais recente da incarnation ATUAL. Depois de um RESETLOGS (modo
+# restaurar) os da incarnation antiga continuam em v$archived_log com
+# sequence# maior e seriam escolhidos por engano.
+arc_mais_recente() {
+  sql_root "select name from v\$archived_log where deleted='NO' and name is not null and resetlogs_change#=(select resetlogs_change# from v\$database) order by sequence# desc;" | head -1 | tr -d ' \t'
+}
+
 fisico_16_archive_faltando() {
   sql_root "alter system switch logfile;" >>"$LOG" 2>&1
-  local arc; arc=$(sql_root "select name from v\$archived_log where deleted='NO' order by sequence# desc;" | head -1 | tr -d ' \t')
+  local arc; arc=$(arc_mais_recente)
   exigir "o archivelog mais recente" "$arc" arq
   rm -f "$arc"
   CHAMADO_TITULO="RMAN crosscheck mostrando archivelog EXPIRED"
@@ -505,7 +512,7 @@ fisico_16_archive_faltando() {
 }
 
 fisico_17_archive_corrompido() {
-  local arc; arc=$(sql_root "select name from v\$archived_log where deleted='NO' order by sequence# desc;" | head -1 | tr -d ' \t')
+  local arc; arc=$(arc_mais_recente)
   exigir "o archivelog mais recente" "$arc" arq
   dd if=/dev/zero of="$arc" bs=8192 seek=5 count=20 conv=notrunc >>"$LOG" 2>&1
   CHAMADO_TITULO="Validacao de archivelog falhando no RMAN"
@@ -801,8 +808,8 @@ executar_cenario() {
 # 2o sorteio os logicos que apagam objetos usados pelos outros cenarios
 # (22 drop table, 26 drop user, 27 drop tablespace) e, se o 1o for um deles,
 # nao ha 2o. CONFLITOS lista pares que nao podem sair juntos porque um anula
-# ou impede o outro (ex.: 10 precisa de linhas em PEDIDOS, 23/24 a esvaziam).
-SORTEIO_CONFLITOS=" 10-23 10-24 23-24 23-25 23-28 24-25 24-28 25-28 30-32 "
+# ou impede o outro (ex.: 10, 11 e 13 precisam de linhas em PEDIDOS, 23/24 a esvaziam; 13 ordena pela coluna que o 28 apaga).
+SORTEIO_CONFLITOS=" 10-23 10-24 11-23 11-24 13-23 13-24 13-28 23-24 23-25 23-28 24-25 24-28 25-28 30-32 "
 conflita() {
   local a="$1" b="$2"
   [ "$a" -gt "$b" ] && { local t="$a"; a="$b"; b="$t"; }
