@@ -51,6 +51,10 @@ cd oracle-break-fix-lab
 
 ### 3. Configurar `lab.conf`
 
+```sh
+cp lab.conf.example lab.conf
+```
+
 Cada linha descreve um banco permitido, no formato:
 
 ```

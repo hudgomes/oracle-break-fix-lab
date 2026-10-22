@@ -1,5 +1,8 @@
 lab.secrets
+lab.conf
 backups/
 logs/
 .state/
+chamados/
+gabarito/
 *.local

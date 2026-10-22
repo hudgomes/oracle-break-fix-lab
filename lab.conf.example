@@ -1,0 +1,7 @@
+# nome:host:ORACLE_HOME:ORACLE_SID:PDB:BACKUP_ROOT
+# PDB = "-" quando o banco nao usa container (non-CDB).
+# O script so atua no banco cuja linha "host" bate com $(hostname -s) deste servidor.
+# host = hostname real da VM (confirme com `hostname -s`, nao um alias de ~/.ssh/config).
+#
+# Copie para lab.conf e ajuste os valores para o seu ambiente.
+TREINO:minhavm:/u01/app/oracle/product/19.0/dbhome_1:orcl:TREINO:/u02/oracle-lab-backup/TREINO
