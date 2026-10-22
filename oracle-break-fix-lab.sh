@@ -5,9 +5,10 @@
 #         | status | backup | restaurar
 #   oracle-break-fix-lab.sh lista   -> lista os 35 cenarios, sem precisar de nome
 #
-# So funciona em laboratorio: os bancos permitidos estao em lab.conf. Antes de
-# qualquer dano, sempre faz backup RMAN completo + copias + verificacao, e exige
-# que o DBA digite o nome do banco para confirmar.
+# So funciona em laboratorio: os bancos permitidos estao em lab.conf. Na
+# primeira execucao faz UM backup RMAN completo + copias + verificacao; as
+# seguintes reaproveitam esse backup (conferido pelo manifesto). Novo backup so
+# com o modo "backup". Sempre exige que o DBA digite o nome do banco.
 set -u
 umask 077
 
@@ -216,6 +217,27 @@ restore validate archivelog from sequence $minseq;
   echo "$dir" > "$LAB_DIR/.state/${NOME}.ultimo_backup"
   aplicar_retencao "$dir"
   echo "$dir"
+}
+
+# Confere a pasta de um backup do laboratorio: DBID, peca de controlfile e
+# manifesto (nenhum arquivo alterado ou faltando).
+conferir_backup() {
+  local dir="$1" dbid
+  dbid=$(tr -d ' \t\r\n' < "$dir/dbid.txt" 2>/dev/null)
+  [[ "$dbid" =~ ^[0-9]+$ ]] || { log "ERRO: DBID invalido ou ausente em $dir/dbid.txt"; return 1; }
+  ls "$dir"/ctl_* >/dev/null 2>&1 || { log "ERRO: peca de controlfile (ctl_*) nao encontrada em $dir"; return 1; }
+  ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) >>"$LOG" 2>&1 \
+    || { log "ERRO: o manifesto de $dir nao confere (arquivo do backup alterado ou faltando)"; return 1; }
+}
+
+aviso_copiar_backup() {
+  local dir="$1"
+  echo
+  echo "IMPORTANTE: o backup de seguranca esta em $dir e e o UNICO ponto de volta do"
+  echo "modo restaurar. COPIE essa pasta para outro lugar e use so a copia nos seus"
+  echo "treinos de restore. Nunca altere, mova ou apague a original -- nem pelo RMAN"
+  echo "('delete backup', 'delete obsolete', 'crosscheck' + 'delete expired' apagam"
+  echo "ou descadastram as pecas originais)."
 }
 
 # Mantem so os BACKUP_KEEP backups validados mais recentes em BACKUP_ROOT (as
@@ -508,7 +530,7 @@ fisico_16_archive_faltando() {
   rm -f "$arc"
   CHAMADO_TITULO="RMAN crosscheck mostrando archivelog EXPIRED"
   CHAMADO_CORPO="Rodei um crosscheck no RMAN do $ORACLE_SID e um archivelog apareceu como EXPIRED, nao sei se e grave."
-  GABARITO_CORPO="Archivelog $arc removido do disco diretamente (fora do RMAN), criando um gap. 'crosscheck archivelog all;' marca EXPIRED; 'delete expired archivelog all;' limpa o catalogo. Como o backup de rotina ja copiou os archivelogs, e possivel recuperar com 'restore archivelog sequence <n>;' caso ele seja necessario para uma recuperacao futura."
+  GABARITO_CORPO="Archivelog $arc removido do disco diretamente (fora do RMAN), criando um gap. 'crosscheck archivelog all;' marca EXPIRED; 'delete expired archivelog all;' limpa o catalogo. Primeiro conferir se ha copia em backup: 'list backup of archivelog sequence <n>;' -- se houver, 'restore archivelog sequence <n>;' resolve. Aqui NAO ha: o arquivo foi gerado depois do ultimo backup, entao o redo dele se perdeu e nenhum backup anterior consegue mais ser recuperado alem desse ponto. A correcao e limpar o catalogo e fazer um backup completo novo na hora (database plus archivelog), que vira o novo ponto de partida."
 }
 
 fisico_17_archive_corrompido() {
@@ -517,7 +539,7 @@ fisico_17_archive_corrompido() {
   dd if=/dev/zero of="$arc" bs=8192 seek=5 count=20 conv=notrunc >>"$LOG" 2>&1
   CHAMADO_TITULO="Validacao de archivelog falhando no RMAN"
   CHAMADO_CORPO="Um 'restore archivelog validate' no $ORACLE_SID esta reportando erro num arquivo que nem foi removido."
-  GABARITO_CORPO="Archivelog $arc continua no disco (por isso o crosscheck nao pega), mas o conteudo foi corrompido com dd -- so aparece em 'restore archivelog validate' ou quando o RMAN tenta de fato le-lo. Correcao: restaurar essa sequencia especifica do backup, 'restore archivelog sequence <n>;'"
+  GABARITO_CORPO="Archivelog $arc continua no disco (por isso o crosscheck nao pega), mas o conteudo foi corrompido com dd -- so aparece em 'restore archivelog validate' ou quando o RMAN tenta de fato le-lo. Primeiro conferir se ha copia em backup: 'list backup of archivelog sequence <n>;' -- se houver, renomear o arquivo ruim e 'restore archivelog sequence <n>;'. Aqui NAO ha: o arquivo foi gerado depois do ultimo backup, entao o redo dele se perdeu. Ate resolver, qualquer 'backup ... plus archivelog' falha nele. Correcao: tirar o arquivo do caminho (mv), 'crosscheck archivelog all; delete noprompt expired archivelog all;' e fazer um backup completo novo na hora -- nenhum backup anterior consegue ser recuperado alem dessa sequencia."
 }
 
 fisico_18_datafile_sem_backup() {
@@ -557,7 +579,7 @@ fisico_19_fra_cheia() {
   local cota_mb=$(( cota / 1048576 )) nova_mb=$(( nova / 1048576 )) usado_mb=$(( usado / 1048576 ))
   CHAMADO_TITULO="Backups e archivelog comecando a falhar por falta de espaco"
   CHAMADO_CORPO="O job de backup do $ORACLE_SID comecou a falhar e os alertas mencionam a FRA quase cheia."
-  GABARITO_CORPO="A cota da FRA ($dest) foi reduzida de $cota_mb MB para $nova_mb MB ('alter system set db_recovery_file_dest_size=$nova scope=both;'), deixando o uso real ($usado_mb MB, sem contar o que o Oracle pode reciclar) em ~97%. Diagnostico: 'select space_limit, space_used, space_reclaimable, number_of_files from v\$recovery_file_dest;' e 'select * from v\$recovery_area_usage;' (por tipo de arquivo); no alert.log aparecem ORA-19815 (aviso de uso) e, quando acabar de vez, ORA-19809/ORA-19804 e o archiver para ('archiver error', sessoes travadas em 'log file switch (archiving needed)'). Correcao imediata: devolver a cota, 'alter system set db_recovery_file_dest_size=${cota_mb}M scope=both;'. Alternativa sem mexer na cota: liberar espaco pelo RMAN ('backup archivelog all delete input;' para outro destino, 'delete obsolete;', 'delete archivelog all completed before ...;' quando ja houver backup). Nunca apagar arquivos da FRA com rm: o Oracle continua contando o espaco ate um 'crosscheck' + 'delete expired'."
+  GABARITO_CORPO="A cota da FRA ($dest) foi reduzida de $cota_mb MB para $nova_mb MB ('alter system set db_recovery_file_dest_size=$nova scope=both;'), deixando o uso real ($usado_mb MB, sem contar o que o Oracle pode reciclar) em ~97%. Diagnostico: 'select space_limit, space_used, space_reclaimable, number_of_files from v\$recovery_file_dest;' e 'select * from v\$recovery_area_usage;' (por tipo de arquivo); no alert.log aparecem ORA-19815 (aviso de uso) e, quando acabar de vez, ORA-19809/ORA-19804 e o archiver para ('archiver error', sessoes travadas em 'log file switch (archiving needed)'). Correcao imediata: devolver a cota, 'alter system set db_recovery_file_dest_size=${cota_mb}M scope=both;'. Alternativa sem mexer na cota: liberar espaco pelo RMAN ('backup archivelog all delete input;' para outro destino ou 'delete archivelog all completed before ...;' quando ja houver backup). Cuidado com 'delete obsolete' neste laboratorio: ele pode apagar as pecas do backup de seguranca do script. Nunca apagar arquivos da FRA com rm: o Oracle continua contando o espaco ate um 'crosscheck' + 'delete expired'."
 }
 
 fisico_20_listener() {
@@ -722,12 +744,9 @@ cmd_status() {
 cmd_restaurar() {
   local dir; dir=$(cat "$LAB_DIR/.state/${NOME}.ultimo_backup" 2>/dev/null)
   [ -n "$dir" ] && [ -d "$dir" ] || die "nao ha backup registrado para restaurar"
-  local dbid; dbid=$(tr -d ' \t\r\n' < "$dir/dbid.txt" 2>/dev/null)
-  [[ "$dbid" =~ ^[0-9]+$ ]] || die "DBID invalido ou ausente em $dir/dbid.txt"
-  local ctl; ctl=$(ls -1t "$dir"/ctl_* 2>/dev/null | head -1)
-  [ -n "$ctl" ] || die "peca de controlfile (ctl_*) nao encontrada em $dir"
-  ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) >>"$LOG" 2>&1 \
-    || die "o manifesto de $dir nao confere (arquivo do backup alterado ou faltando), abortando"
+  conferir_backup "$dir" || die "backup $dir nao pode ser usado, abortando sem mexer no banco"
+  local dbid; dbid=$(tr -d ' \t\r\n' < "$dir/dbid.txt")
+  local ctl; ctl=$(ls -1t "$dir"/ctl_* | head -1)
   log "Restaurando $NOME a partir de $dir (DBID $dbid, controlfile $ctl) ..."
 
   # Arquivos que alguns cenarios tiram do lugar e que o RMAN nao restaura aqui
@@ -774,9 +793,18 @@ alter database mount;
   # consistente). Lido do controlfile restaurado, que conhece o backup inteiro.
   local scn; scn=$(sql_root "select max(next_change#) from v\$backup_redolog where resetlogs_change#=(select resetlogs_change# from v\$database);" | tr -d ' \t')
   [[ "$scn" =~ ^[0-9]+$ ]] || die "nao consegui calcular o SCN final do backup (valor: '$scn')"
-  log "Recuperando ate o SCN $scn (fim do backup)"
+  # incarnation do backup, lida antes de qualquer restore: ao restaurar, o RMAN
+  # cataloga sozinho os archivelogs da FRA, inclusive os de incarnations
+  # criadas por restaurar anteriores, e passa a tratar a mais nova como atual
+  # (RMAN-20208 "UNTIL CHANGE is before RESETLOGS change" na 2a restauracao
+  # do mesmo backup). O reset abaixo devolve a incarnation certa.
+  local inc; inc=$(sql_root "select incarnation# from v\$database_incarnation where status='CURRENT';" | tr -d ' \t')
+  [[ "$inc" =~ ^[0-9]+$ ]] || die "nao consegui ler a incarnation do backup (valor: '$inc')"
+  log "Recuperando ate o SCN $scn (fim do backup, incarnation $inc)"
 
   saida=$(rman_run "
+catalog recovery area noprompt;
+reset database to incarnation $inc;
 run {
   set until scn $scn;
   restore database;
@@ -855,7 +883,19 @@ cmd_destruir() {
   local modo="$1"
   verificar_db_aberto || die "banco/PDB nao esta aberto -- abra manualmente antes de rodar o laboratorio (regra: nunca abrir no lugar do DBA)"
   confirmar_nome
-  preflight_backup >/dev/null || die "backup de seguranca falhou, abortando sem causar dano"
+  # Backup so na primeira execucao; depois reaproveita o mesmo (conferido).
+  local bkp; bkp=$(cat "$LAB_DIR/.state/${NOME}.ultimo_backup" 2>/dev/null)
+  if [ -n "$bkp" ] && [ -d "$bkp" ]; then
+    conferir_backup "$bkp" || die "o backup de seguranca $bkp nao esta integro. Nada foi estragado. Recoloque a pasta original (da sua copia) ou gere outro com o modo 'backup'"
+    local dbid_atual; dbid_atual=$(sql_root "select dbid from v\$database;" | tr -d ' \t\r\n')
+    [ "$dbid_atual" = "$(tr -d ' \t\r\n' < "$bkp/dbid.txt")" ] \
+      || die "o backup $bkp e de outro banco (DBID $(cat "$bkp/dbid.txt"), o atual e $dbid_atual). Gere um novo com o modo 'backup'"
+    log "Usando o backup de seguranca existente $bkp (sem backup novo nesta execucao)"
+  else
+    log "Primeira execucao para $NOME: criando o backup de seguranca (so desta vez)"
+    preflight_backup >/dev/null || die "backup de seguranca falhou, abortando sem causar dano"
+    bkp=$(cat "$LAB_DIR/.state/${NOME}.ultimo_backup")
+  fi
 
   local alvo=()
   case "$modo" in
@@ -874,8 +914,7 @@ cmd_destruir() {
   for n in "${alvo[@]}"; do
     executar_cenario "$n"
   done
-  echo
-  echo "Pronto. Use 'copie os backups em $BACKUP_ROOT para um local de sua preferencia, MANTENDO o backup onde esta' antes de qualquer teste que possa sujar ainda mais o ambiente."
+  aviso_copiar_backup "$bkp"
 }
 
 # -------------------------------------------------------------------- CLI --
@@ -897,7 +936,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 
   case "$MODO" in
     status) cmd_status ;;
-    backup) confirmar_nome; preflight_backup ;;
+    backup) confirmar_nome; preflight_backup >/dev/null || die "backup falhou"
+            aviso_copiar_backup "$(cat "$LAB_DIR/.state/${NOME}.ultimo_backup")" ;;
     restaurar) confirmar_nome; cmd_restaurar ;;
     fisica|logica|"") cmd_destruir "$MODO" ;;
     [0-9]*) cmd_destruir "$MODO" ;;

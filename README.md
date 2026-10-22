@@ -24,9 +24,17 @@ estatísticas, lixeira...). Testado em Oracle 12.1 e Oracle AI Database
 - Roda como o usuário `oracle` do sistema operacional (autenticação
   `/ as sysdba` via grupo), local na própria VM do banco — não é uma
   ferramenta remota.
-- Todo cenário sempre faz backup RMAN completo + verificação de
-  integridade **antes** de causar o dano. Ainda assim, não é um
-  substituto para o backup real do seu ambiente.
+- Na **primeira** execução o script faz um backup RMAN completo +
+  verificação de integridade **antes** de causar o dano. As execuções
+  seguintes reaproveitam esse mesmo backup (conferem o manifesto e o
+  DBID antes; se não baterem, param sem estragar nada). Para um backup
+  novo, rode o modo `backup`. Não é um substituto para o backup real
+  do seu ambiente.
+- **Copie a pasta do backup e nunca mexa na original.** Ela é o único
+  ponto de volta do modo `restaurar`. Treine restores só pela cópia, e
+  cuidado com `delete backup`, `delete obsolete` e `crosscheck` +
+  `delete expired` no RMAN: eles apagam ou descadastram as peças
+  originais.
 - **O script muda uma configuração permanente do RMAN no seu banco.**
   Todo backup de segurança roda `CONFIGURE CONTROLFILE AUTOBACKUP ON`,
   que fica gravado no controlfile e continua valendo depois, para
@@ -79,7 +87,8 @@ nome:host:ORACLE_HOME:ORACLE_SID:PDB:BACKUP_ROOT
   (cada backup é uma subpasta `AAAAMMDD-HHMMSS`; de preferência um
   disco com espaço de sobra, fora do `ORACLE_HOME`).
 
-Retenção: depois de cada backup validado o script mantém só os
+Retenção: depois de cada backup validado (primeira execução ou modo
+`backup`) o script mantém só os
 **3** mais recentes de cada banco e apaga as subpastas mais antigas
 (e as de backups que falharam), tirando as peças do registro do RMAN
 antes. Para mudar a quantidade, acrescente ao `lab.conf` uma linha
@@ -137,7 +146,7 @@ chmod +x oracle-break-fix-lab.sh
 ./oracle-break-fix-lab.sh TREINO logica         # sorteia so entre os logicos (22-35)
 ./oracle-break-fix-lab.sh TREINO 7              # roda o cenario 7 direto
 ./oracle-break-fix-lab.sh TREINO status         # estado atual, ultimo backup/cenario
-./oracle-break-fix-lab.sh TREINO backup         # forca um novo backup (sem estragar nada)
+./oracle-break-fix-lab.sh TREINO backup         # gera um backup novo (sem estragar nada)
 ./oracle-break-fix-lab.sh TREINO restaurar      # restaura do ultimo backup valido
 ```
 
