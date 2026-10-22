@@ -27,6 +27,15 @@ estatísticas, lixeira...). Testado em Oracle 12.1 e Oracle AI Database
 - Todo cenário sempre faz backup RMAN completo + verificação de
   integridade **antes** de causar o dano. Ainda assim, não é um
   substituto para o backup real do seu ambiente.
+- **O script muda uma configuração permanente do RMAN no seu banco.**
+  Todo backup de segurança roda `CONFIGURE CONTROLFILE AUTOBACKUP ON`,
+  que fica gravado no controlfile e continua valendo depois, para
+  qualquer backup ou mudança de estrutura (o Oracle passa a gravar um
+  autobackup de controlfile + spfile na FRA, ou em `$ORACLE_HOME/dbs`
+  se não houver FRA). Se o seu banco usava `OFF`, volte depois com
+  `rman target /` → `CONFIGURE CONTROLFILE AUTOBACKUP OFF;` (ou
+  `CONFIGURE CONTROLFILE AUTOBACKUP CLEAR;` para o padrão da versão).
+  Confira o valor atual com `SHOW CONTROLFILE AUTOBACKUP;`.
 
 ## Instalação
 
@@ -67,8 +76,15 @@ nome:host:ORACLE_HOME:ORACLE_SID:PDB:BACKUP_ROOT
 - `PDB`: nome da pluggable database, ou `-` se o banco não usa
   container (non-CDB).
 - `BACKUP_ROOT`: pasta onde os backups RMAN de segurança vão ficar
-  (pode crescer bastante; de preferência um disco com espaço de
-  sobra, fora do `ORACLE_HOME`).
+  (cada backup é uma subpasta `AAAAMMDD-HHMMSS`; de preferência um
+  disco com espaço de sobra, fora do `ORACLE_HOME`).
+
+Retenção: depois de cada backup validado o script mantém só os
+**3** mais recentes de cada banco e apaga as subpastas mais antigas
+(e as de backups que falharam), tirando as peças do registro do RMAN
+antes. Para mudar a quantidade, acrescente ao `lab.conf` uma linha
+`BACKUP_KEEP=<n>` (mínimo 1). Só são apagadas subpastas com o nome
+no formato que o próprio script cria.
 
 Exemplo:
 
@@ -128,6 +144,23 @@ chmod +x oracle-break-fix-lab.sh
 Troque `TREINO` pelo `nome` que você escolheu no `lab.conf`. Em todo
 modo destrutivo, o script pede para você digitar o nome do banco de
 novo, como confirmação.
+
+- **Sorteio sem argumento:** 1 cenário qualquer e, 1 vez em 5, mais um
+  cenário **lógico** diferente do primeiro (nunca dois físicos, nunca o
+  mesmo duas vezes, nunca um par em que um cenário anula o outro). O
+  lógico é aplicado primeiro, com o banco no ar; depois vem o outro.
+- **Se o cenário não conseguir ler o alvo do dano** (por exemplo, não há
+  grupo de redo no estado esperado, ou a tabela de treino sumiu por um
+  cenário anterior não corrigido), ele para **antes** de estragar
+  qualquer coisa e não gera chamado nem gabarito.
+- **`restaurar`** volta o banco inteiro ao ponto do último backup do
+  laboratório: usa o DBID salvo em `dbid.txt` e a peça de controlfile
+  `ctl_*` da própria pasta do backup, restaura e recupera até o fim
+  desse backup e abre com `RESETLOGS` (nova incarnation). Tudo o que
+  aconteceu no banco depois do backup se perde, não só o dano do
+  cenário. Também recoloca spfile e password file se um cenário os
+  tirou do lugar, remove o lixo do cenário de FRA cheia, sobe o
+  listener e reabre as PDBs que estavam abertas na hora do backup.
 
 ### Saídas
 

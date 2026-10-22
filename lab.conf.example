@@ -5,3 +5,6 @@
 #
 # Copie para lab.conf e ajuste os valores para o seu ambiente.
 TREINO:minhavm:/u01/app/oracle/product/19.0/dbhome_1:orcl:TREINO:/u02/oracle-lab-backup/TREINO
+#
+# Opcional: quantos backups de seguranca manter por banco em BACKUP_ROOT (padrao 3).
+# BACKUP_KEEP=3
